@@ -26,7 +26,7 @@ class SLDS(eqx.Module):
     emission_dim : int = eqx.static_field()
 
     transition_logits : Float[Array, "num_states num_states-1"]
-    dynamics_matrices : Float[Array, "num_states latent_dim latent_dim"]
+    dynamics_matrices : Float[Array, "num_states latent_dim latent_dim"] # For each state this is latent_dim x latent_dim
     dynamics_biases : Float[Array, "num_states latent_dim"]
     dynamics_diag_logvars : Float[Array, "num_states latent_dim"]
     emission_matrix : Float[Array, "emission_dim latent_dim"]

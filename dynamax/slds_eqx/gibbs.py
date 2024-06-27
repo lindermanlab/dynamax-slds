@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-
+from jax import lax
 from jax import vmap
 from jaxtyping import Array, Float
 from tensorflow_probability.substrates import jax as tfp
@@ -11,12 +11,12 @@ MVN = tfd.MultivariateNormalFullCovariance
 MVNDiag = tfd.MultivariateNormalDiag
 
 from dynamax import hidden_markov_model as hmm
-
+from dynamax import linear_gaussian_ssm as lgssm
 from .models import SLDS
 
 def fit_gibbs(slds : SLDS, 
               key : jr.PRNGKey, 
-              emissions : Float[Array["num_timesteps emission_dim"]], 
+              emissions : Float[Array["num_timesteps emission_dim"]], #array of floats of dim num_timesteps x emission_dim
               initial_zs : Float[Array["num_timesteps"]], 
               initial_xs : Float[Array["num_timesteps latent_dim"]], 
               num_iters : int = 100
@@ -25,12 +25,17 @@ def fit_gibbs(slds : SLDS,
     Run a Gibbs sampler to draw (approximate) samples from the posterior distribution over
     discrete and continuous latent states of an SLDS.
     """
-    K = slds.num_states
+    K = slds.num_states 
     D = slds.latent_dim
     N = slds.emission_dim
-    ys = emissions
+    ys = emissions # num_timesteps x emission_dim
 
-    def _update_discrete_states(slds, key, xs):
+    #theta denotes parameters of the model
+    #z denotes discrete latent states
+    #x denotes continuous latent states
+    #y denotes emissions
+
+    def _update_discrete_states(slds, key1, xs):
         """
         Update the discrete states by drawing a sample from p(z | x, theta)
 
@@ -50,28 +55,94 @@ def fit_gibbs(slds : SLDS,
         # Stack the initial log prob and subsequent log probs into one array
         lls = jnp.vstack([ll0, lls])
     
-        return hmm.inference.hmm_posterior_sample(key, pi0, P, lls)
+        return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
 
-    def _update_continuous_states(slds, ys, zs):
+    def _update_continuous_states(slds, key2, ys, zs):
         # TODO: sample from the p(x | z, y) by using lgssm_posterior_sample 
         # and giving the function time-varying parameters A_t = A_{z_t}
+        """
+        Update the continuous states by drawing a sample from p(x | z, y)
+        """
+        T = ys.shape[0] #number of timesteps
+
+        # Initialize time-varying parameters
+        As = slds.dynamics_matrices
+        bs = slds.dynamics_biases
+        Qs = slds.dynamics_covs
+        C = slds.emission_matrix
+        d = slds.emission_bias
+        R = slds.emission_cov
+
+        # Compute parameters for each time step using the discrete states
+        A_t = vmap(lambda z: As[z])(zs)
+        b_t = vmap(lambda z: bs[z])(zs)
+        Q_t = vmap(lambda z: Qs[z])(zs)
+
+        # Create ParamsLGSSM object to pass into lgssm_posterior_sample
+        params = lgssm.inference.ParamsLGSSM(
+            initial= lgssm.inference.ParamsLGSSMInitial(
+                mean=jnp.zeros(D),
+                cov=jnp.eye(D) #identity matrix - assumes initial latent dimensions are uncorrelated
+            ),
+            dynamics=lgssm.inference.ParamsLGSSMDynamics(
+                #ntime x state_dim x state_dim
+                weights=A_t,
+                bias=b_t,
+                input_weights=None,
+                cov=Q_t
+            ),
+            emissions=lgssm.inference.ParamsLGSSMEmissions(
+                #broadcasting C, d, R to have shape (T, N, D), (T, N), (T, N, N)
+                weights=jnp.repeat(C[None, :, :], T, axis=0),
+                bias=jnp.repeat(d[None, :], T, axis=0),
+                input_weights=None,
+                cov=jnp.repeat(R[None, :, :], T, axis=0)
+            ),
+        )
+
+        # Sample from the posterior distribution
+        xs = lgssm.inference.lgssm_posterior_sample(key2, params, ys)
 
         return xs
     
     def _update_params(slds, ys, zs, xs, lr=1e-3, num_iters=10):
         return slds
 
-    def _step(carry, step_size):
+    def _step(carry, step_size): #not using step_size here (num_iters is used instead)
         # TODO
         # 1. call _update_discrete_states
         # 2. call _update_continuous_states
         # 3. compute the log joint probability (using slds.log_prob)
         # 4. return new_carry and output lp
-        raise NotImplementedError
+
+        # Unpack Carry
+        zs, xs, slds, key = carry
+
+        # Update Key to generate new random samples
+        key, subkey1, subkey2 = jr.split(key, 3)
+
+        # Update Discrete States p(z₁:ₜ | x₁:ₜ, θ)
+        zs = _update_discrete_states(slds, subkey1, xs)
+
+        # Update Continuous States p(x₁:ₜ | z₁:ₜ, y₁:ₜ, θ)
+        xs = _update_continuous_states(slds, subkey2, ys, zs)
+
+        # Compute Log Joint Probability log p(y₁:ₜ, z₁:ₜ, x₁:ₜ | θ)
+        lp = slds.log_prob(ys, zs, xs)
+
+        # Update Parameters
+        slds = _update_params(slds, ys, zs, xs)
+
+        # Return New Carry and Output Log Probability
+        new_carry = (zs, xs, slds, key)
+
+        return new_carry, lp
 
     # TODO: initialize carry and call scan
-    # initial_carry = (initial_zs, initial_xs, slds, key)
-    # final_carry, lps = lax.scan(_step, initial_carry, step_sizes)
+    initial_carry = (initial_zs, initial_xs, slds, key)
+    final_carry, lps = lax.scan(_step, initial_carry, jnp.arange(num_iters)) #step_size is num_iters
 
-    
+    # Unpack Final Carry
+    zs, xs, slds, key = final_carry
+
     return slds, lps, zs, xs

@@ -78,7 +78,7 @@ class ParamsLGSSMEmissions(NamedTuple):
     """
     weights: Union[ParameterProperties,
         Float[Array, "emission_dim state_dim"], 
-        Float[Array, "ntime emission_dim state_dim"]]
+        Float[Array, "ntime emission_dim state_dim"]] #time varying definition
     
     bias: Union[ParameterProperties,
         Float[Array, "emission_dim"], 
@@ -91,9 +91,9 @@ class ParamsLGSSMEmissions(NamedTuple):
     cov: Union[ParameterProperties,
         Float[Array, "emission_dim emission_dim"], 
         Float[Array, "ntime emission_dim emission_dim"], 
-        Float[Array, "emission_dim"], 
+        Float[Array, "emission_dim"],  #diagonal covariance
         Float[Array, "ntime emission_dim"], 
-        Float[Array, "emission_dim_triu"]]
+        Float[Array, "emission_dim_triu"]] # Upper triangular covariance
 
 
 class ParamsLGSSM(NamedTuple):
