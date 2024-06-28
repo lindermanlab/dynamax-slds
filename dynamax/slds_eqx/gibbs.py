@@ -1,8 +1,11 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax import lax
-from jax import vmap
+import jax.tree as tree
+import operator
+import optax 
+
+from jax import grad, lax, vmap
 from jaxtyping import Array, Float
 from tensorflow_probability.substrates import jax as tfp
 tfd = tfp.distributions
@@ -105,7 +108,48 @@ def fit_gibbs(slds : SLDS,
 
         return xs
     
-    def _update_params(slds, ys, zs, xs, lr=1e-3, num_iters=10):
+    def _update_params(slds, ys, zs, xs, lr=1e-3, reg=1.0, num_iters=10):
+        r"""
+        Goal: maximize the expected log probability as a function of parameters \theta:
+            L(\theta) = E_{p(z, x | y, \theta')}[log p(y, z, x; \theta)]
+
+        We can't compute the posterior exactly, so instead we'll approximate it with
+        Monte Carlo, using Gibbs to generate samples of z and x and then 
+        maximize the approximate objective,
+            
+            \tilde{L}(\theta) = \frac{1}{S} \sum_s log p(y, z_s, x_s; \theta)
+
+        where the latent states are (approximately) sampled from the posterior
+
+            z_s, x_s \sim p(z, x | y, \theta')
+
+        In practice, we are setting S = 1 (i.e., using a single sample of the latents).
+
+        Technically, to guarantee convergence we need to add an additional constraint.
+        Namely, we can't let the parameters change too much from one iteration to the
+        next, so we include a regularizer
+
+            R(\theta) = \frac{\alpha}{2} \|\theta - \theta'\|_2^2
+
+        The final objective combines these two terms.
+        """
+        T = ys.shape[0]
+        def loss(curr_slds):
+            L = -1 * curr_slds.log_prob(ys, zs, xs) / T
+            L += 0.5 * reg * tree.reduce(
+                operator.add,
+                tree.map(lambda x, y: jnp.sum((x - y)**2), curr_slds, slds),
+                0.0)
+            return L
+        
+        # Minimize the loss with optax
+        # TODO: replace for loop with a scan
+        optimizer = optax.adam(lr)
+        opt_state = optimizer.init(slds)
+        for _ in range(num_iters):
+            grads = grad(loss)(slds)
+            updates, opt_state = optimizer.update(grads, opt_state)
+            slds = optax.apply_updates(slds, updates)
         return slds
 
     def _step(carry, step_size): #not using step_size here (num_iters is used instead)
