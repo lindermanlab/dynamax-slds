@@ -8,6 +8,9 @@ import optax
 from jax import grad, lax, vmap
 from jaxtyping import Array, Float
 from tensorflow_probability.substrates import jax as tfp
+import jax.numpy as jnp
+import jax.random as jr
+from typing import Callable
 tfd = tfp.distributions
 tfb = tfp.bijectors
 MVN = tfd.MultivariateNormalFullCovariance
@@ -19,10 +22,13 @@ from .models import SLDS
 
 def fit_gibbs(slds : SLDS, 
               key : jr.PRNGKey, 
-              emissions : Float[Array["num_timesteps emission_dim"]], #array of floats of dim num_timesteps x emission_dim
-              initial_zs : Float[Array["num_timesteps"]], 
-              initial_xs : Float[Array["num_timesteps latent_dim"]], 
-              num_iters : int = 100
+              emissions : jnp.ndarray,#Float[Array["num_timesteps emission_dim"]],
+              initial_zs : jnp.ndarray, #Float[Array["num_timesteps"]], 
+              initial_xs :jnp.ndarray, #Float[Array["num_timesteps latent_dim"]], 
+              num_iters : int = 100,
+              lr : float = 1e-3,
+              reg_schedule : Callable[[int], float] = lambda t: 1.0, # can decide how to schedule the regularization as function of t/Gibbs iterations
+              param_update_iters : int = 10
               ):
     """
     Run a Gibbs sampler to draw (approximate) samples from the posterior distribution over
@@ -32,6 +38,9 @@ def fit_gibbs(slds : SLDS,
     D = slds.latent_dim
     N = slds.emission_dim
     ys = emissions # num_timesteps x emission_dim
+
+    optimizer = optax.adam(lr)
+    opt_state = optimizer.init(slds)
 
     #theta denotes parameters of the model
     #z denotes discrete latent states
@@ -53,11 +62,12 @@ def fit_gibbs(slds : SLDS,
         
         # log p(x_t | x_{t-1}, z_t=k) for all t=2,...,T and all k=1,...,K
         f = lambda z: vmap(lambda x, xn: slds.dynamics_distn(z, x).log_prob(xn))(xs[:-1], xs[1:])   # [K] -> (T-1,)
-        lls = vmap(f, jnp.arange(K)).T                                                              # (T-1,K)
+        lls = vmap(f)(jnp.arange(K)).T                                                            # (T-1,K)
 
         # Stack the initial log prob and subsequent log probs into one array
         lls = jnp.vstack([ll0, lls])
-    
+
+        #zs = hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
         return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
 
     def _update_continuous_states(slds, key2, ys, zs):
@@ -77,9 +87,12 @@ def fit_gibbs(slds : SLDS,
         R = slds.emission_cov
 
         # Compute parameters for each time step using the discrete states
-        A_t = vmap(lambda z: As[z])(zs)
-        b_t = vmap(lambda z: bs[z])(zs)
-        Q_t = vmap(lambda z: Qs[z])(zs)
+        A_t = As[zs]
+        b_t = bs[zs]
+        Q_t = Qs[zs]
+        # A_t = vmap(lambda z: As[z])(zs)
+        # b_t = vmap(lambda z: bs[z])(zs)
+        # Q_t = vmap(lambda z: Qs[z])(zs)
 
         # Create ParamsLGSSM object to pass into lgssm_posterior_sample
         params = lgssm.inference.ParamsLGSSM(
@@ -96,10 +109,10 @@ def fit_gibbs(slds : SLDS,
             ),
             emissions=lgssm.inference.ParamsLGSSMEmissions(
                 #broadcasting C, d, R to have shape (T, N, D), (T, N), (T, N, N)
-                weights=jnp.repeat(C[None, :, :], T, axis=0),
-                bias=jnp.repeat(d[None, :], T, axis=0),
+                weights= C, #jnp.repeat(C[None, :, :], T, axis=0),
+                bias=d,#jnp.repeat(d[None, :], T, axis=0),
                 input_weights=None,
-                cov=jnp.repeat(R[None, :, :], T, axis=0)
+                cov=R#jnp.repeat(R[None, :, :], T, axis=0)
             ),
         )
 
@@ -108,7 +121,7 @@ def fit_gibbs(slds : SLDS,
 
         return xs
     
-    def _update_params(slds, ys, zs, xs, lr=1e-3, reg=1.0, num_iters=10):
+    def _update_params(slds, ys, zs, xs, opt_state, reg=1.0, num_iters=10):
         r"""
         Goal: maximize the expected log probability as a function of parameters \theta:
             L(\theta) = E_{p(z, x | y, \theta')}[log p(y, z, x; \theta)]
@@ -133,6 +146,7 @@ def fit_gibbs(slds : SLDS,
 
         The final objective combines these two terms.
         """
+
         T = ys.shape[0]
         def loss(curr_slds):
             L = -1 * curr_slds.log_prob(ys, zs, xs) / T
@@ -141,18 +155,21 @@ def fit_gibbs(slds : SLDS,
                 tree.map(lambda x, y: jnp.sum((x - y)**2), curr_slds, slds),
                 0.0)
             return L
-        
-        # Minimize the loss with optax
-        # TODO: replace for loop with a scan
-        optimizer = optax.adam(lr)
-        opt_state = optimizer.init(slds)
-        for _ in range(num_iters):
-            grads = grad(loss)(slds)
-            updates, opt_state = optimizer.update(grads, opt_state)
-            slds = optax.apply_updates(slds, updates)
-        return slds
 
-    def _step(carry, step_size): #not using step_size here (num_iters is used instead)
+        # Define a single step of the optimization
+        def step(carry, _):
+            curr_slds, opt_state = carry
+            grads = grad(loss)(curr_slds)
+            updates, new_opt_state = optimizer.update(grads, opt_state)
+            new_slds = optax.apply_updates(curr_slds, updates)
+            return (new_slds, new_opt_state), None
+
+        # Run the optimization using lax.scan
+        (final_slds, final_opt_state), _ = lax.scan(step, (slds, opt_state), None, length=num_iters)
+
+        return final_slds, final_opt_state
+
+    def _step(carry, t): #not using step_size here (num_iters is used instead)
         # TODO
         # 1. call _update_discrete_states
         # 2. call _update_continuous_states
@@ -160,7 +177,9 @@ def fit_gibbs(slds : SLDS,
         # 4. return new_carry and output lp
 
         # Unpack Carry
-        zs, xs, slds, key = carry
+        zs, xs, slds, opt_state, key = carry
+        #zs = jax.tree_util.tree_map(lambda z: jnp.asarray(z, dtype=jnp.int32), zs)
+
 
         # Update Key to generate new random samples
         key, subkey1, subkey2 = jr.split(key, 3)
@@ -174,19 +193,22 @@ def fit_gibbs(slds : SLDS,
         # Compute Log Joint Probability log p(y₁:ₜ, z₁:ₜ, x₁:ₜ | θ)
         lp = slds.log_prob(ys, zs, xs)
 
+        # Compute regularization strength for this iteration
+        reg = reg_schedule(t)
+
         # Update Parameters
-        slds = _update_params(slds, ys, zs, xs)
+        slds, opt_state = _update_params(slds, ys, zs, xs, opt_state, reg, param_update_iters)
 
         # Return New Carry and Output Log Probability
-        new_carry = (zs, xs, slds, key)
+        new_carry = (zs, xs, slds, opt_state, key)
 
         return new_carry, lp
 
     # TODO: initialize carry and call scan
-    initial_carry = (initial_zs, initial_xs, slds, key)
+    initial_carry = (initial_zs, initial_xs, slds, opt_state, key)
     final_carry, lps = lax.scan(_step, initial_carry, jnp.arange(num_iters)) #step_size is num_iters
 
     # Unpack Final Carry
-    zs, xs, slds, key = final_carry
+    zs, xs, slds, _, _ = final_carry
 
     return slds, lps, zs, xs
