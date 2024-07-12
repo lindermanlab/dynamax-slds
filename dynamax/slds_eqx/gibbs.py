@@ -67,7 +67,6 @@ def fit_gibbs(slds : SLDS,
         # Stack the initial log prob and subsequent log probs into one array
         lls = jnp.vstack([ll0, lls])
 
-        #zs = hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
         return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
 
     def _update_continuous_states(slds, key2, ys, zs):
@@ -178,8 +177,6 @@ def fit_gibbs(slds : SLDS,
 
         # Unpack Carry
         zs, xs, slds, opt_state, key = carry
-        #zs = jax.tree_util.tree_map(lambda z: jnp.asarray(z, dtype=jnp.int32), zs)
-
 
         # Update Key to generate new random samples
         key, subkey1, subkey2 = jr.split(key, 3)
