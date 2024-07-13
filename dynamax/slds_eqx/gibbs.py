@@ -67,7 +67,7 @@ def fit_gibbs(slds : SLDS,
         # Stack the initial log prob and subsequent log probs into one array
         lls = jnp.vstack([ll0, lls])
 
-        return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)
+        return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)[1]
 
     def _update_continuous_states(slds, key2, ys, zs):
         # TODO: sample from the p(x | z, y) by using lgssm_posterior_sample 
@@ -84,6 +84,8 @@ def fit_gibbs(slds : SLDS,
         C = slds.emission_matrix
         d = slds.emission_bias
         R = slds.emission_cov
+        initial_mean = jnp.zeros(D)
+        initial_cov = jnp.eye(D)
 
         # Compute parameters for each time step using the discrete states
         A_t = As[zs]
@@ -94,25 +96,17 @@ def fit_gibbs(slds : SLDS,
         # Q_t = vmap(lambda z: Qs[z])(zs)
 
         # Create ParamsLGSSM object to pass into lgssm_posterior_sample
-        params = lgssm.inference.ParamsLGSSM(
-            initial= lgssm.inference.ParamsLGSSMInitial(
-                mean=jnp.zeros(D),
-                cov=jnp.eye(D) #identity matrix - assumes initial latent dimensions are uncorrelated
-            ),
-            dynamics=lgssm.inference.ParamsLGSSMDynamics(
-                #ntime x state_dim x state_dim
-                weights=A_t,
-                bias=b_t,
-                input_weights=None,
-                cov=Q_t
-            ),
-            emissions=lgssm.inference.ParamsLGSSMEmissions(
-                #broadcasting C, d, R to have shape (T, N, D), (T, N), (T, N, N)
-                weights= C, #jnp.repeat(C[None, :, :], T, axis=0),
-                bias=d,#jnp.repeat(d[None, :], T, axis=0),
-                input_weights=None,
-                cov=R#jnp.repeat(R[None, :, :], T, axis=0)
-            ),
+        params = lgssm.inference.make_lgssm_params(
+            initial_mean=initial_mean,
+            initial_cov=initial_cov,
+            dynamics_weights=A_t,
+            dynamics_cov=Q_t,
+            emissions_weights=C,
+            emissions_cov=R,
+            dynamics_bias=b_t,
+            dynamics_input_weights=None,
+            emissions_bias=d,
+            emissions_input_weights=None,
         )
 
         # Sample from the posterior distribution
