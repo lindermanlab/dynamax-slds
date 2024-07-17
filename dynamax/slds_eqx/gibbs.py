@@ -27,7 +27,7 @@ def fit_gibbs(slds : SLDS,
               initial_xs :jnp.ndarray, #Float[Array["num_timesteps latent_dim"]], 
               num_iters : int = 100,
               lr : float = 1e-3,
-              reg_schedule : Callable[[int], float] = lambda t: 1.0, # can decide how to schedule the regularization as function of t/Gibbs iterations
+              reg_schedule : Callable[[int], float] = lambda t: 1.0,
               param_update_iters : int = 10
               ):
     """
@@ -37,7 +37,7 @@ def fit_gibbs(slds : SLDS,
     K = slds.num_states 
     D = slds.latent_dim
     N = slds.emission_dim
-    ys = emissions # num_timesteps x emission_dim
+    ys = emissions
 
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(slds)
@@ -70,8 +70,6 @@ def fit_gibbs(slds : SLDS,
         return hmm.inference.hmm_posterior_sample(key1, pi0, P, lls)[1]
 
     def _update_continuous_states(slds, key2, ys, zs):
-        # TODO: sample from the p(x | z, y) by using lgssm_posterior_sample 
-        # and giving the function time-varying parameters A_t = A_{z_t}
         """
         Update the continuous states by drawing a sample from p(x | z, y)
         """
@@ -91,11 +89,7 @@ def fit_gibbs(slds : SLDS,
         A_t = As[zs]
         b_t = bs[zs]
         Q_t = Qs[zs]
-        # A_t = vmap(lambda z: As[z])(zs)
-        # b_t = vmap(lambda z: bs[z])(zs)
-        # Q_t = vmap(lambda z: Qs[z])(zs)
 
-        # Create ParamsLGSSM object to pass into lgssm_posterior_sample
         params = lgssm.inference.make_lgssm_params(
             initial_mean=initial_mean,
             initial_cov=initial_cov,
@@ -162,13 +156,7 @@ def fit_gibbs(slds : SLDS,
 
         return final_slds, final_opt_state
 
-    def _step(carry, t): #not using step_size here (num_iters is used instead)
-        # TODO
-        # 1. call _update_discrete_states
-        # 2. call _update_continuous_states
-        # 3. compute the log joint probability (using slds.log_prob)
-        # 4. return new_carry and output lp
-
+    def _step(carry, t):
         # Unpack Carry
         zs, xs, slds, opt_state, key = carry
 
@@ -195,9 +183,8 @@ def fit_gibbs(slds : SLDS,
 
         return new_carry, lp
 
-    # TODO: initialize carry and call scan
     initial_carry = (initial_zs, initial_xs, slds, opt_state, key)
-    final_carry, lps = lax.scan(_step, initial_carry, jnp.arange(num_iters)) #step_size is num_iters
+    final_carry, lps = lax.scan(_step, initial_carry, jnp.arange(num_iters))
 
     # Unpack Final Carry
     zs, xs, slds, _, _ = final_carry
