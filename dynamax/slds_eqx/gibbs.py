@@ -22,9 +22,9 @@ from .models import SLDS
 
 def fit_gibbs(slds : SLDS, 
               key : jr.PRNGKey, 
-              emissions : jnp.ndarray,#Float[Array["num_timesteps emission_dim"]],
-              initial_zs : jnp.ndarray, #Float[Array["num_timesteps"]], 
-              initial_xs :jnp.ndarray, #Float[Array["num_timesteps latent_dim"]], 
+              emissions : jnp.ndarray,
+              initial_zs : jnp.ndarray,
+              initial_xs :jnp.ndarray,
               num_iters : int = 100,
               lr : float = 1e-3,
               reg_schedule : Callable[[int], float] = lambda t: 1.0,
@@ -41,11 +41,6 @@ def fit_gibbs(slds : SLDS,
 
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(slds)
-
-    #theta denotes parameters of the model
-    #z denotes discrete latent states
-    #x denotes continuous latent states
-    #y denotes emissions
 
     def _update_discrete_states(slds, key1, xs):
         """
@@ -73,7 +68,6 @@ def fit_gibbs(slds : SLDS,
         """
         Update the continuous states by drawing a sample from p(x | z, y)
         """
-        T = ys.shape[0] #number of timesteps
 
         # Initialize time-varying parameters
         As = slds.dynamics_matrices
