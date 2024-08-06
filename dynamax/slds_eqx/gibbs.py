@@ -4,13 +4,12 @@ import jax.random as jr
 import jax.tree as tree
 import operator
 import optax 
-
+import blackjax
+from typing import Tuple, Callable
 from jax import grad, lax, vmap
 from jaxtyping import Array, Float
 from tensorflow_probability.substrates import jax as tfp
-import jax.numpy as jnp
-import jax.random as jr
-from typing import Callable
+from typing import Callable, Literal, Optional
 tfd = tfp.distributions
 tfb = tfp.bijectors
 MVN = tfd.MultivariateNormalFullCovariance
@@ -28,7 +27,12 @@ def fit_gibbs(slds : SLDS,
               num_iters : int = 100,
               lr : float = 1e-3,
               reg_schedule : Callable[[int], float] = lambda t: 1.0,
-              param_update_iters : int = 10
+              param_update_method: Literal["gradient", "hmc"] = "gradient",
+              param_update_iters : int = 10,
+              hmc_num_samples : int = 100,
+              hmc_num_warmup : int = 100,
+              hmc_step_size : float = 1e-3,
+              hmc_num_integration_steps : int = 10
               ):
     """
     Run a Gibbs sampler to draw (approximate) samples from the posterior distribution over
@@ -39,8 +43,11 @@ def fit_gibbs(slds : SLDS,
     N = slds.emission_dim
     ys = emissions
 
-    optimizer = optax.adam(lr)
-    opt_state = optimizer.init(slds)
+    if param_update_method == "gradient":
+        optimizer = optax.adam(lr)
+        opt_state = optimizer.init(slds)
+    else:
+        opt_state = None
 
     def _update_discrete_states(slds, key1, xs):
         """
@@ -102,7 +109,7 @@ def fit_gibbs(slds : SLDS,
 
         return xs
     
-    def _update_params(slds, ys, zs, xs, opt_state, reg=1.0, num_iters=10):
+    def _update_params_gradient(slds, ys, zs, xs, opt_state, reg=1.0, num_iters=10):
         r"""
         Goal: maximize the expected log probability as a function of parameters \theta:
             L(\theta) = E_{p(z, x | y, \theta')}[log p(y, z, x; \theta)]
@@ -149,13 +156,21 @@ def fit_gibbs(slds : SLDS,
         (final_slds, final_opt_state), _ = lax.scan(step, (slds, opt_state), None, length=num_iters)
 
         return final_slds, final_opt_state
-
+    
+    def _update_params_hmc(slds, ys, zs, xs, key, reg=1.0):
+        return update_parameters_hmc(slds, ys, zs, xs, key, 
+                                     num_samples=hmc_num_samples,
+                                     num_warmup=hmc_num_warmup,
+                                     step_size=hmc_step_size,
+                                     num_integration_steps=hmc_num_integration_steps,
+                                     reg=reg)
+    
     def _step(carry, t):
         # Unpack Carry
         zs, xs, slds, opt_state, key = carry
 
         # Update Key to generate new random samples
-        key, subkey1, subkey2 = jr.split(key, 3)
+        key, subkey1, subkey2, subkey3 = jr.split(key, 4)
 
         # Update Discrete States p(z₁:ₜ | x₁:ₜ, θ)
         zs = _update_discrete_states(slds, subkey1, xs)
@@ -170,7 +185,10 @@ def fit_gibbs(slds : SLDS,
         reg = reg_schedule(t)
 
         # Update Parameters
-        slds, opt_state = _update_params(slds, ys, zs, xs, opt_state, reg, param_update_iters)
+        if param_update_method == "gradient":
+            slds, opt_state = _update_params_gradient(slds, ys, zs, xs, opt_state, reg, param_update_iters)
+        else:  # HMC
+            slds, _ = _update_params_hmc(slds, ys, zs, xs, subkey3, reg)
 
         # Return New Carry and Output Log Probability
         new_carry = (zs, xs, slds, opt_state, key)
@@ -184,3 +202,81 @@ def fit_gibbs(slds : SLDS,
     zs, xs, slds, _, _ = final_carry
 
     return slds, lps, zs, xs
+
+def update_parameters_hmc(slds: SLDS, 
+                          ys: jnp.ndarray, 
+                          zs: jnp.ndarray, 
+                          xs: jnp.ndarray, 
+                          key: jr.PRNGKey,
+                          num_samples: int = 100,
+                          num_warmup: int = 100,
+                          step_size: float = 1e-3,
+                          num_integration_steps: int = 10,
+                          reg: float = 1.0) -> Tuple[SLDS, jnp.ndarray]:
+    """
+    Update SLDS parameters using Hamiltonian Monte Carlo.
+    
+    This function can be used as an alternative to _update_params in the Gibbs sampling loop.
+    """
+    def log_posterior(params):
+        # Unpack parameters
+        pi0, transition_matrix, dynamics_matrices, dynamics_biases, dynamics_covs, emission_matrix, emission_bias, emission_cov = params
+        
+        # Create a temporary SLDS with the new parameters
+        temp_slds = SLDS(slds.num_states, slds.latent_dim, slds.emission_dim)
+        temp_slds.pi0 = pi0
+        temp_slds.transition_matrix = transition_matrix
+        temp_slds.dynamics_matrices = dynamics_matrices
+        temp_slds.dynamics_biases = dynamics_biases
+        temp_slds.dynamics_covs = dynamics_covs
+        temp_slds.emission_matrix = emission_matrix
+        temp_slds.emission_bias = emission_bias
+        temp_slds.emission_cov = emission_cov
+
+        # Compute log probability
+        log_prob = temp_slds.log_prob(ys, zs, xs)
+        
+        # Add regularization term
+        reg_term = 0.5 * reg * sum(jnp.sum((p1 - p2)**2) for p1, p2 in zip(params, (
+            slds.pi0, slds.transition_matrix, slds.dynamics_matrices, slds.dynamics_biases,
+            slds.dynamics_covs, slds.emission_matrix, slds.emission_bias, slds.emission_cov
+        )))
+        
+        return log_prob - reg_term
+
+    # Pack current parameters
+    initial_params = (
+        slds.pi0,
+        slds.transition_matrix,
+        slds.dynamics_matrices,
+        slds.dynamics_biases,
+        slds.dynamics_covs,
+        slds.emission_matrix,
+        slds.emission_bias,
+        slds.emission_cov
+    )
+
+    # Set up HMC
+    hmc = blackjax.hmc(log_posterior, step_size, jnp.ones_like(initial_params), num_integration_steps)
+    state = hmc.init(initial_params)
+
+    # Run HMC
+    @jax.jit
+    def one_step(state, key):
+        state, _ = hmc.step(key, state)
+        return state, state.position
+
+    keys = jr.split(key, num_samples + num_warmup)
+    _, samples = jax.lax.scan(one_step, state, keys)
+
+    # Discard warmup samples
+    samples = samples[num_warmup:]
+
+    # Update SLDS with mean of samples
+    mean_params = jax.tree_map(lambda x: jnp.mean(x, axis=0), samples)
+    
+    slds.pi0, slds.transition_matrix, slds.dynamics_matrices, slds.dynamics_biases, slds.dynamics_covs, \
+    slds.emission_matrix, slds.emission_bias, slds.emission_cov = mean_params
+
+    return slds, samples
+    
