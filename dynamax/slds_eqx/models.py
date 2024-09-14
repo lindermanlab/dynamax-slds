@@ -143,6 +143,7 @@ class SLDS(eqx.Module):
         _, (zs, xs, ys) = lax.scan(_step, (z0, x0, y0), jr.split(key, num_timesteps))
         return zs, xs, ys
 
+
 class RSLDS(SLDS):
     """
     A Recurrent Switching Linear Dynamical System
@@ -150,33 +151,35 @@ class RSLDS(SLDS):
     This class extends SLDS by making the discrete state transitions
     dependent on the continuous state.
     """
-    transition_network: eqx.nn.MLP
+    transition_network: Union[eqx.nn.Linear, eqx.nn.MLP]
 
     def __init__(self,
                  num_states: int,
                  latent_dim: int,
                  emission_dim: int,
                  log_P, As, bs, log_Qs, C, d, log_R,
+                 transition_network_type: Literal["linear", "mlp"] = "linear",
                  transition_network_hidden_dims: tuple = (32, 32)):
         super().__init__(num_states, latent_dim, emission_dim, log_P, As, bs, log_Qs, C, d, log_R)
         
-        # Initialize the transition network
-        self.transition_network = eqx.nn.MLP(
-            in_size=latent_dim,
-            out_size=num_states,
-            width_size=transition_network_hidden_dims[0],
-            depth=len(transition_network_hidden_dims),
-            activation=jax.nn.tanh
-        )
+        if transition_network_type == "linear":
+            self.transition_network = eqx.nn.Linear(latent_dim, num_states)
+        elif transition_network_type == "mlp":
+            self.transition_network = eqx.nn.MLP(
+                in_size=latent_dim,
+                out_size=num_states,
+                width_size=transition_network_hidden_dims[0],
+                depth=len(transition_network_hidden_dims),
+                activation=jax.nn.tanh
+            )
+        else:
+            raise ValueError("transition_network_type must be 'linear' or 'mlp'")
 
     def transition_distn(self, z, x):
-        """
-        Compute the transition distribution p(z_t | z_{t-1}, x_{t-1})
-        """
         P = self.transition_matrix
         logits = self.transition_network(x)
-        probs = jax.nn.softmax(logits)
-        return tfd.Categorical(probs=probs * P[z])
+        # Use logits directly in the Categorical distribution
+        return tfd.Categorical(logits=logits + jnp.log(P[z]))
 
     def log_prob(self, ys, zs, xs):
         # Start with the SLDS log probability

@@ -4,6 +4,7 @@ import jax.random as jr
 import jax.tree as tree
 import operator
 import optax 
+import equinox as eqx
 import blackjax
 from typing import Tuple, Callable
 from jax import grad, lax, vmap
@@ -32,8 +33,10 @@ def fit_gibbs(slds : SLDS,
               hmc_num_samples : int = 100,
               hmc_num_warmup : int = 100,
               hmc_step_size : float = 1e-3,
-              hmc_num_integration_steps : int = 10
+              hmc_num_integration_steps : int = 10,
+              frozen_params: Optional[List[str]] = None
               ):
+    #TODO: Look at jax.lax.stop_gradient
     """
     Run a Gibbs sampler to draw (approximate) samples from the posterior distribution over
     discrete and continuous latent states of an SLDS.
@@ -43,9 +46,15 @@ def fit_gibbs(slds : SLDS,
     N = slds.emission_dim
     ys = emissions
 
+    if frozen_params is None:
+        frozen_params = []
+
+    def param_filter(param):
+        return not any(param.name.startswith(fp) for fp in frozen_params)
+
     if param_update_method == "gradient":
         optimizer = optax.adam(lr)
-        opt_state = optimizer.init(slds)
+        opt_state = optimizer.init(eqx.filter(slds, param_filter))
     else:
         opt_state = None
 
@@ -140,16 +149,19 @@ def fit_gibbs(slds : SLDS,
             L = -1 * curr_slds.log_prob(ys, zs, xs) / T
             L += 0.5 * reg * tree.reduce(
                 operator.add,
-                tree.map(lambda x, y: jnp.sum((x - y)**2), curr_slds, slds),
+                tree.map(lambda x, y: jnp.sum((x - y)**2), 
+                         eqx.filter(curr_slds, param_filter), 
+                         eqx.filter(slds, param_filter)),
                 0.0)
             return L
 
         # Define a single step of the optimization
+        @eqx.filter_jit
         def step(carry, _):
             curr_slds, opt_state = carry
-            grads = grad(loss)(curr_slds)
+            grads = eqx.filter_grad(loss)(curr_slds)
             updates, new_opt_state = optimizer.update(grads, opt_state)
-            new_slds = optax.apply_updates(curr_slds, updates)
+            new_slds = eqx.apply_updates(curr_slds, updates, where=param_filter)
             return (new_slds, new_opt_state), None
 
         # Run the optimization using lax.scan
