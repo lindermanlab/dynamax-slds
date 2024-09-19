@@ -143,3 +143,77 @@ class SLDS(eqx.Module):
         _, (zs, xs, ys) = lax.scan(_step, (z0, x0, y0), jr.split(key, num_timesteps))
         return zs, xs, ys
 
+
+class RSLDS(SLDS):
+    """
+    A Recurrent Switching Linear Dynamical System
+
+    This class extends SLDS by making the discrete state transitions
+    dependent on the continuous state.
+    """
+    transition_network: Union[eqx.nn.Linear, eqx.nn.MLP]
+
+    def __init__(self,
+                 num_states: int,
+                 latent_dim: int,
+                 emission_dim: int,
+                 log_P, As, bs, log_Qs, C, d, log_R,
+                 transition_network_type: Literal["linear", "mlp"] = "linear",
+                 transition_network_hidden_dims: tuple = (32, 32)):
+        super().__init__(num_states, latent_dim, emission_dim, log_P, As, bs, log_Qs, C, d, log_R)
+        
+        if transition_network_type == "linear":
+            self.transition_network = eqx.nn.Linear(latent_dim, num_states)
+        elif transition_network_type == "mlp":
+            self.transition_network = eqx.nn.MLP(
+                in_size=latent_dim,
+                out_size=num_states,
+                width_size=transition_network_hidden_dims[0],
+                depth=len(transition_network_hidden_dims),
+                activation=jax.nn.tanh
+            )
+        else:
+            raise ValueError("transition_network_type must be 'linear' or 'mlp'")
+
+    def transition_distn(self, z, x):
+        P = self.transition_matrix
+        logits = self.transition_network(x)
+        # Use logits directly in the Categorical distribution
+        return tfd.Categorical(logits=logits + jnp.log(P[z]))
+
+    def log_prob(self, ys, zs, xs):
+        # Start with the SLDS log probability
+        lp = super().log_prob(ys, zs, xs)
+        
+        # Subtract the old transition probability (computed in the SLDS)
+        lp -= vmap(lambda z, zn: super().transition_distn(z).log_prob(zn))(zs[:-1], zs[1:]).sum()
+        
+        # Add the new transition probability
+        lp += vmap(lambda z, x, zn: self.transition_distn(z, x).log_prob(zn))(zs[:-1], xs[:-1], zs[1:]).sum()
+        
+        return lp
+
+    def sample(self, key: jr.PRNGKey, num_timesteps: int):
+        # Sample the first time step
+        k1, k2, k3, key = jr.split(key, 4)
+        z0 = self.init_discrete_state_distn().sample(seed=k1)
+        x0 = self.init_continuous_state_distn(z0).sample(seed=k2)
+        y0 = self.emission_distn(x0).sample(seed=k3)
+
+        def _step(carry, key):
+            zp, xp = carry
+            k1, k2, k3 = jr.split(key, 3)
+
+            z = self.transition_distn(zp, xp).sample(seed=k1)
+            x = self.dynamics_distn(z, xp).sample(seed=k2)
+            y = self.emission_distn(x).sample(seed=k3)
+            return (z, x), (z, x, y)
+
+        (zs, xs), (_, _, ys) = lax.scan(_step, (z0, x0), jr.split(key, num_timesteps-1))
+        
+        # Prepend the initial states
+        zs = jnp.concatenate([z0[None], zs])
+        xs = jnp.concatenate([x0[None], xs])
+        ys = jnp.concatenate([y0[None], ys])
+        
+        return zs, xs, ys
